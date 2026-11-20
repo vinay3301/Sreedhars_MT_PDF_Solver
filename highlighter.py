@@ -13,13 +13,21 @@ HIGHLIGHT_YELLOW = (1.0, 0.85, 0.0)
 HIGHLIGHT_OPACITY = 0.30
 
 
+def _log(progress_callback, message):
+    """Send a real processing message to the caller and keep server logging."""
+    print(message, flush=True)
+    if progress_callback:
+        progress_callback(message)
+
+
 # -------------------- ANSWER KEY --------------------
 
-def extract_answer_key(doc):
+def extract_answer_key(doc, progress_callback=None):
     """Extract question-number/option-number pairs from the final PDF page."""
     if len(doc) == 0:
         raise ValueError("The PDF is empty.")
 
+    _log(progress_callback, "Reading the answer key from the last page...")
     text = doc[-1].get_text("text")
     key_pos = text.upper().rfind("KEY")
     if key_pos < 0:
@@ -40,7 +48,7 @@ def extract_answer_key(doc):
     if not answers:
         raise ValueError("The KEY was found, but no answers could be extracted.")
 
-    print(f"\nAnswer key detected: {len(answers)} question(s).")
+    _log(progress_callback, f"Answer key detected: {len(answers)} question(s).")
     return answers
 
 
@@ -54,7 +62,6 @@ def get_lines(page):
     for block in raw.get("blocks", []):
         if block.get("type") != 0:
             continue
-
         for line in block.get("lines", []):
             spans = line.get("spans", [])
             chars = [
@@ -91,12 +98,7 @@ def make_rect(chars, start=0, end=None):
 
 
 def option_markers(text):
-    """
-    Find option labels 1) through 5), without requiring spaces.
-
-    Handles joined labels such as '...II4) Only I' and labels whose
-    answer text is on the next PDF line, such as a standalone '4) '.
-    """
+    """Find option labels 1) through 5), without requiring spaces."""
     return list(re.finditer(r"(?<!\d)([1-5])\)", text))
 
 
@@ -111,7 +113,7 @@ def add_highlight(page, rect, color):
 
 # -------------------- PDF PROCESSING --------------------
 
-def process_pdf(input_path):
+def process_pdf(input_path, progress_callback=None):
     input_path = Path(input_path)
 
     if not input_path.exists():
@@ -119,17 +121,18 @@ def process_pdf(input_path):
     if input_path.suffix.lower() != ".pdf":
         raise ValueError("Please upload a PDF file.")
 
-    print(f"\nOpening: {input_path.name}")
+    _log(progress_callback, f"Opening: {input_path.name}")
     doc = pymupdf.open(str(input_path))
 
     try:
-        answers = extract_answer_key(doc)
-
+        answers = extract_answer_key(doc, progress_callback)
         questions_seen = set()
         correct_options_found = {}
         # Store (page_number, rectangle) so failed questions can be marked yellow.
         option_rectangles = {}
         total_green = 0
+
+        _log(progress_callback, f"Starting question-page processing ({len(doc)} page(s))...")
 
         for page_index, page in enumerate(doc):
             lines = get_lines(page)
@@ -139,7 +142,6 @@ def process_pdf(input_path):
 
             for line in lines:
                 text = line["text"]
-
                 # Do not process the answer-key section as question content.
                 if re.match(r"^\s*KEY\b", text, re.IGNORECASE):
                     current_question = None
@@ -169,7 +171,6 @@ def process_pdf(input_path):
                     continuation_question = None
                     first_q = int(direction_match.group(1))
                     last_q = direction_match.group(2)
-
                     if last_q is not None:
                         current_question = None
                         structured_question = False
@@ -201,12 +202,9 @@ def process_pdf(input_path):
                         end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
                         while end > start and text[end - 1].isspace():
                             end -= 1
-
                         rect = make_rect(line["chars"], start, end)
                         if rect is not None:
-                            option_rectangles[current_question].append(
-                                (page_index, rect)
-                            )
+                            option_rectangles[current_question].append((page_index, rect))
 
                     # Locate and highlight the answer-key option.
                     wanted = answers[current_question]
@@ -215,14 +213,12 @@ def process_pdf(input_path):
                         for i, marker in enumerate(markers)
                         if int(marker.group(1)) == wanted
                     ]
-
                     if matching:
                         i, marker = matching[0]
                         start = marker.start(1)
                         end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
                         while end > start and text[end - 1].isspace():
                             end -= 1
-
                         rect = make_rect(line["chars"], start, end)
                         if rect is not None:
                             add_highlight(page, rect, HIGHLIGHT_GREEN)
@@ -231,8 +227,7 @@ def process_pdf(input_path):
                                 correct_options_found.get(current_question, 0) + 1
                             )
 
-                        # Continue onto the next line if this was the final
-                        # option label on the current line.
+                        # Continue onto the next line if this was the final option.
                         if i == len(markers) - 1:
                             continuation_question = current_question
 
@@ -252,15 +247,11 @@ def process_pdf(input_path):
                     else:
                         continuation_question = None
 
-            print(
-                f"  Page {page_index + 1:2}/{len(doc)} processed",
-                end="\r"
-            )
-
-        print()
+            _log(progress_callback, f"Page {page_index + 1}/{len(doc)} processed.")
 
         # -------------------- NON-FATAL CROSS-CHECK --------------------
 
+        _log(progress_callback, "Cross-checking detected questions against the answer key...")
         missing_questions = sorted(set(answers) - questions_seen)
         failed_matches = sorted(
             q for q in answers
@@ -276,23 +267,30 @@ def process_pdf(input_path):
                 yellow_count += 1
 
         if missing_questions or failed_matches:
-            print("\nWARNING: ANSWER-KEY CROSS-CHECK NEEDS REVIEW.")
+            _log(progress_callback, "WARNING: ANSWER-KEY CROSS-CHECK NEEDS REVIEW.")
             if missing_questions:
-                print("Questions not detected in question pages:",
-                      ", ".join(map(str, missing_questions)))
+                _log(
+                    progress_callback,
+                    "Questions not detected in question pages: "
+                    + ", ".join(map(str, missing_questions))
+                )
             if failed_matches:
-                print("Correct option could not be matched:",
-                      ", ".join(map(str, failed_matches)))
-                print("Their detected option text has been marked yellow.")
-            print("The PDF will still be saved and downloaded.")
+                _log(
+                    progress_callback,
+                    "Correct option could not be matched: "
+                    + ", ".join(map(str, failed_matches))
+                )
+                _log(progress_callback, "Their detected option text has been marked yellow.")
+            _log(progress_callback, "The PDF will still be generated.")
         else:
-            print(
-                f"Answer-key cross-check passed: all {len(answers)} "
-                "questions matched."
+            _log(
+                progress_callback,
+                f"Answer-key cross-check passed: all {len(answers)} questions matched."
             )
 
         # -------------------- SAVE OUTPUT --------------------
 
+        _log(progress_callback, "Applying highlights and saving the solution PDF...")
         output_path = input_path.with_name(
             input_path.stem + " with answers" + input_path.suffix
         )
@@ -301,18 +299,13 @@ def process_pdf(input_path):
             output_path.unlink()
 
         doc.save(str(output_path), garbage=4, deflate=True)
-
-        print("\nSuccessfully created:")
-        print(output_path)
-        print(f"Answer-key questions: {len(answers)}")
-        print(f"Questions detected: {len(questions_seen)}")
-        print(f"Green highlight segments: {total_green}")
-        print(f"Yellow fallback segments: {yellow_count}")
+        _log(progress_callback, "Successfully created the solution PDF.")
+        _log(progress_callback, f"Answer-key questions: {len(answers)}")
+        _log(progress_callback, f"Questions detected: {len(questions_seen)}")
+        _log(progress_callback, f"Green highlight segments: {total_green}")
+        _log(progress_callback, f"Yellow fallback segments: {yellow_count}")
 
         return output_path
 
     finally:
         doc.close()
-
-
-# Web backend calls process_pdf(input_path) directly.

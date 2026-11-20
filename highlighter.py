@@ -1,37 +1,239 @@
-import os
 import re
 from pathlib import Path
 
 import pymupdf
 
-# -------------------- SETTINGS --------------------
+# -------------------- APPLICATION LIMITS --------------------
 
 QUESTION_MIN = 1
 QUESTION_MAX = 1000
+
+MAX_FILE_SIZE = 20 * 1024 * 1024       # 20 MB
+MIN_PAGES = 1
+MAX_PAGES = 20
+
 HIGHLIGHT_GREEN = (6 / 255, 85 / 255, 53 / 255)
 HIGHLIGHT_YELLOW = (1.0, 0.85, 0.0)
 HIGHLIGHT_OPACITY = 0.30
 
+# Only names such as "Model Test 100.pdf" are accepted.
+# Case-insensitive; one or more digits are required.
+VALID_FILENAME_RE = re.compile(r"^Model\s+Test\s+\d+\.pdf$", re.IGNORECASE)
 
-def _log(progress_callback, message):
-    """Send a real processing message to the caller and keep server logging."""
+
+# -------------------- PROGRESS / ERRORS --------------------
+
+def report(message, progress_callback=None):
+    """Send a progress message to the web app and also print it to logs."""
     print(message, flush=True)
     if progress_callback:
-        progress_callback(message)
+        try:
+            progress_callback(message)
+        except Exception:
+            # A progress-display problem must not stop PDF processing.
+            pass
+
+
+class PDFValidationError(ValueError):
+    """A safe, user-facing upload validation error."""
+
+
+# -------------------- UPLOAD VALIDATION --------------------
+
+def validate_upload(input_path):
+    """
+    Validate the uploaded file before answer-key extraction or highlighting.
+
+    Checks filename, extension, size, PDF signature, readability, encryption,
+    page count, extractable text, question-paper structure and answer key.
+    Returns an opened PyMuPDF document. Caller must close it.
+    """
+    input_path = Path(input_path)
+
+    if not input_path.exists() or not input_path.is_file():
+        raise PDFValidationError("Upload failed: the selected file was not found.")
+
+    # 1. Filename pattern.
+    if not VALID_FILENAME_RE.fullmatch(input_path.name):
+        raise PDFValidationError(
+            "Invalid filename. Please use the format 'Model Test 100.pdf' "
+            "(the number may vary)."
+        )
+
+    # 2. Extension.
+    if input_path.suffix.lower() != ".pdf":
+        raise PDFValidationError("Invalid file type. Please upload a PDF file.")
+
+    # 3. File size.
+    try:
+        file_size = input_path.stat().st_size
+    except OSError:
+        raise PDFValidationError("The uploaded file could not be read.")
+
+    if file_size <= 0:
+        raise PDFValidationError("The uploaded PDF is empty.")
+
+    if file_size > MAX_FILE_SIZE:
+        raise PDFValidationError("File too large. Maximum allowed size is 20 MB.")
+
+    # 4. PDF signature (do not trust the extension or browser MIME type).
+    try:
+        with input_path.open("rb") as file_handle:
+            signature = file_handle.read(5)
+    except OSError:
+        raise PDFValidationError("The uploaded file could not be read.")
+
+    if signature != b"%PDF-":
+        raise PDFValidationError(
+            "Invalid PDF: the file does not contain a valid PDF signature."
+        )
+
+    # 5. Open and parse the actual PDF.
+    try:
+        doc = pymupdf.open(str(input_path))
+    except Exception as exc:
+        raise PDFValidationError(
+            "Corrupted or unreadable PDF. Please open the file on your device "
+            "and upload a working copy."
+        ) from exc
+
+    try:
+        if not doc.is_pdf:
+            raise PDFValidationError("The uploaded file is not a valid PDF.")
+
+        # 6. Encrypted/password-protected files.
+        if doc.needs_pass:
+            raise PDFValidationError(
+                "Password-protected PDF. Please remove the password and upload "
+                "an unlocked PDF."
+            )
+
+        if getattr(doc, "is_encrypted", False):
+            # Some PDFs report encrypted even when an empty password works.
+            try:
+                authenticated = doc.authenticate("")
+            except Exception:
+                authenticated = 0
+            if not authenticated:
+                raise PDFValidationError(
+                    "Password-protected PDF. Please upload an unlocked PDF."
+                )
+
+        # 7. Page count.
+        page_count = len(doc)
+        if page_count < MIN_PAGES:
+            raise PDFValidationError("The PDF contains no pages.")
+        if page_count > MAX_PAGES:
+            raise PDFValidationError(
+                "Page limit exceeded. A maximum of 20 pages is allowed."
+            )
+
+        # 8. Extractable text. Scanned/image-only PDFs are not supported.
+        page_texts = []
+        total_text_chars = 0
+        for page in doc:
+            try:
+                page_text = page.get_text("text") or ""
+            except Exception as exc:
+                raise PDFValidationError(
+                    "The PDF contains unreadable page content."
+                ) from exc
+            page_texts.append(page_text)
+            total_text_chars += len(re.sub(r"\s+", "", page_text))
+
+        if total_text_chars < 30:
+            raise PDFValidationError(
+                "No usable selectable text was found. Scanned/image-only PDFs "
+                "are not supported; please upload a text-based PDF."
+            )
+
+        # 9. Check for recognisable question-paper content on pages before
+        # the final answer-key page. Keep this broad enough for different layouts.
+        question_pages_text = "\n".join(page_texts[:-1] if page_count > 1 else page_texts)
+        question_number_pattern = re.compile(
+            r"(?im)^\s*(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s+"
+        )
+        option_pattern = re.compile(r"(?<!\d)[1-5]\s*[)]")
+
+        question_number_hits = len(question_number_pattern.findall(question_pages_text))
+        option_hits = len(option_pattern.findall(question_pages_text))
+
+        if question_number_hits == 0:
+            raise PDFValidationError(
+                "Unsupported document: question numbers were not recognised. "
+                "Please upload a Sreedhar's Institute Model Test question paper."
+            )
+
+        if option_hits < 2:
+            raise PDFValidationError(
+                "Unsupported document: multiple-choice options were not "
+                "recognised. Please upload the original Model Test question paper."
+            )
+
+        # 10. Answer key must be present and extractable on the final page.
+        last_page_text = page_texts[-1]
+        if not re.search(r"\bKEY\b", last_page_text, re.IGNORECASE):
+            raise PDFValidationError(
+                "Answer key not detected on the last page. Please check that "
+                "you uploaded the complete Model Test PDF."
+            )
+
+        key_pos = last_page_text.upper().rfind("KEY")
+        key_text = last_page_text[key_pos:]
+        answer_pairs = re.findall(
+            r"(?<!\d)(\d{1,3})\s*\.\s*([1-5])(?!\d)",
+            key_text
+        )
+        valid_pairs = [
+            (int(q), int(opt))
+            for q, opt in answer_pairs
+            if QUESTION_MIN <= int(q) <= QUESTION_MAX
+        ]
+
+        if not valid_pairs:
+            raise PDFValidationError(
+                "The answer key heading was found, but no readable answers "
+                "could be extracted from the last page."
+            )
+
+        # At least one extracted key item must correspond to a question number
+        # detected in the question pages. This helps reject unrelated PDFs
+        # that happen to contain the word KEY and numbered lists.
+        detected_numbers = {
+            int(match)
+            for match in re.findall(
+                r"(?im)^\s*(?:Q(?:uestion)?\s*)?(\d{1,3})\s*[.)]\s+",
+                question_pages_text
+            )
+        }
+        if detected_numbers and not any(q in detected_numbers for q, _ in valid_pairs):
+            raise PDFValidationError(
+                "The answer key does not appear to match the question pages. "
+                "Please upload the complete original Model Test PDF."
+            )
+
+        report(
+            f"Upload validation passed: {input_path.name} "
+            f"({page_count} page(s), {file_size / (1024 * 1024):.2f} MB)."
+        )
+        return doc
+
+    except Exception:
+        doc.close()
+        raise
 
 
 # -------------------- ANSWER KEY --------------------
 
-def extract_answer_key(doc, progress_callback=None):
+def extract_answer_key(doc):
     """Extract question-number/option-number pairs from the final PDF page."""
     if len(doc) == 0:
-        raise ValueError("The PDF is empty.")
+        raise PDFValidationError("The PDF is empty.")
 
-    _log(progress_callback, "Reading the answer key from the last page...")
     text = doc[-1].get_text("text")
     key_pos = text.upper().rfind("KEY")
     if key_pos < 0:
-        raise ValueError("Could not find 'KEY' on the last PDF page.")
+        raise PDFValidationError("Could not find 'KEY' on the last PDF page.")
 
     key_text = text[key_pos:]
     matches = re.findall(
@@ -46,9 +248,10 @@ def extract_answer_key(doc, progress_callback=None):
             answers[q] = option
 
     if not answers:
-        raise ValueError("The KEY was found, but no answers could be extracted.")
+        raise PDFValidationError(
+            "The answer key was found, but no answers could be extracted."
+        )
 
-    _log(progress_callback, f"Answer key detected: {len(answers)} question(s).")
     return answers
 
 
@@ -62,11 +265,11 @@ def get_lines(page):
     for block in raw.get("blocks", []):
         if block.get("type") != 0:
             continue
+
         for line in block.get("lines", []):
-            spans = line.get("spans", [])
             chars = [
                 char
-                for span in spans
+                for span in line.get("spans", [])
                 for char in span.get("chars", [])
             ]
             if not chars:
@@ -85,26 +288,27 @@ def make_rect(chars, start=0, end=None):
         end = len(chars)
 
     selected = chars[max(0, start):min(len(chars), end)]
-    boxes = [c["bbox"] for c in selected if c.get("bbox")]
+    boxes = [char["bbox"] for char in selected if char.get("bbox")]
     if not boxes:
         return None
 
     return pymupdf.Rect(
-        min(b[0] for b in boxes),
-        min(b[1] for b in boxes),
-        max(b[2] for b in boxes),
-        max(b[3] for b in boxes),
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
     )
 
 
 def option_markers(text):
-    """Find option labels 1) through 5), without requiring spaces."""
+    """Find option labels 1) through 5), including labels without spaces."""
     return list(re.finditer(r"(?<!\d)([1-5])\)", text))
 
 
 def add_highlight(page, rect, color):
     if rect is None or rect.is_empty:
         return
+
     annot = page.add_highlight_annot(rect)
     annot.set_colors(stroke=color)
     annot.set_opacity(HIGHLIGHT_OPACITY)
@@ -114,27 +318,35 @@ def add_highlight(page, rect, color):
 # -------------------- PDF PROCESSING --------------------
 
 def process_pdf(input_path, progress_callback=None):
+    """
+    Validate and process one Model Test PDF.
+
+    The optional progress_callback(message) is used by the web app to stream
+    processing logs to the browser. Existing callers may continue using
+    process_pdf(input_path).
+    """
     input_path = Path(input_path)
+    report(f"Checking uploaded file: {input_path.name}", progress_callback)
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"File not found: {input_path}")
-    if input_path.suffix.lower() != ".pdf":
-        raise ValueError("Please upload a PDF file.")
-
-    _log(progress_callback, f"Opening: {input_path.name}")
-    doc = pymupdf.open(str(input_path))
+    doc = validate_upload(input_path)
 
     try:
-        answers = extract_answer_key(doc, progress_callback)
+        report("Reading answer key...", progress_callback)
+        answers = extract_answer_key(doc)
+        report(f"Answer key detected: {len(answers)} question(s).", progress_callback)
+
         questions_seen = set()
         correct_options_found = {}
-        # Store (page_number, rectangle) so failed questions can be marked yellow.
         option_rectangles = {}
         total_green = 0
 
-        _log(progress_callback, f"Starting question-page processing ({len(doc)} page(s))...")
+        question_pages = max(1, len(doc) - 1)
 
         for page_index, page in enumerate(doc):
+            report(
+                f"Processing page {page_index + 1}/{len(doc)}...",
+                progress_callback
+            )
             lines = get_lines(page)
             current_question = None
             continuation_question = None
@@ -142,6 +354,7 @@ def process_pdf(input_path, progress_callback=None):
 
             for line in lines:
                 text = line["text"]
+
                 # Do not process the answer-key section as question content.
                 if re.match(r"^\s*KEY\b", text, re.IGNORECASE):
                     current_question = None
@@ -160,7 +373,7 @@ def process_pdf(input_path, progress_callback=None):
                         questions_seen.add(current_question)
                     continue
 
-                # Detect direction groups such as Direction (1-5).
+                # Detect direction groups such as Directions (1-5).
                 direction_match = re.search(
                     r"\bDirections?\s*:?\s*\(\s*(\d{1,3})"
                     r"(?:\s*[-–—]\s*(\d{1,3}))?\s*\)",
@@ -171,6 +384,7 @@ def process_pdf(input_path, progress_callback=None):
                     continuation_question = None
                     first_q = int(direction_match.group(1))
                     last_q = direction_match.group(2)
+
                     if last_q is not None:
                         current_question = None
                         structured_question = False
@@ -183,7 +397,6 @@ def process_pdf(input_path, progress_callback=None):
 
                 markers = option_markers(text)
 
-                # In a single-question direction group, wait for its options.
                 if structured_question:
                     if not markers:
                         continue
@@ -196,29 +409,41 @@ def process_pdf(input_path, progress_callback=None):
                     continuation_question = None
                     option_rectangles.setdefault(current_question, [])
 
-                    # Record all visible option ranges for possible yellow fallback.
+                    # Store all visible options for yellow manual-review fallback.
                     for i, marker in enumerate(markers):
                         start = marker.start(1)
-                        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+                        end = (
+                            markers[i + 1].start()
+                            if i + 1 < len(markers)
+                            else len(text)
+                        )
                         while end > start and text[end - 1].isspace():
                             end -= 1
+
                         rect = make_rect(line["chars"], start, end)
                         if rect is not None:
-                            option_rectangles[current_question].append((page_index, rect))
+                            option_rectangles[current_question].append(
+                                (page_index, rect)
+                            )
 
-                    # Locate and highlight the answer-key option.
                     wanted = answers[current_question]
                     matching = [
                         (i, marker)
                         for i, marker in enumerate(markers)
                         if int(marker.group(1)) == wanted
                     ]
+
                     if matching:
                         i, marker = matching[0]
                         start = marker.start(1)
-                        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+                        end = (
+                            markers[i + 1].start()
+                            if i + 1 < len(markers)
+                            else len(text)
+                        )
                         while end > start and text[end - 1].isspace():
                             end -= 1
+
                         rect = make_rect(line["chars"], start, end)
                         if rect is not None:
                             add_highlight(page, rect, HIGHLIGHT_GREEN)
@@ -227,12 +452,11 @@ def process_pdf(input_path, progress_callback=None):
                                 correct_options_found.get(current_question, 0) + 1
                             )
 
-                        # Continue onto the next line if this was the final option.
                         if i == len(markers) - 1:
                             continuation_question = current_question
 
                 elif continuation_question == current_question:
-                    # Handle option values split onto their own PDF text lines.
+                    # Handle option text that wraps onto the next PDF text line.
                     if text.strip() and not re.match(r"^\s*\d{1,3}\.", text):
                         rect = make_rect(line["chars"])
                         if rect is not None:
@@ -247,50 +471,36 @@ def process_pdf(input_path, progress_callback=None):
                     else:
                         continuation_question = None
 
-            _log(progress_callback, f"Page {page_index + 1}/{len(doc)} processed.")
+        report("Checking answer matches...", progress_callback)
 
-        # -------------------- NON-FATAL CROSS-CHECK --------------------
-
-        _log(progress_callback, "Cross-checking detected questions against the answer key...")
+        # Cross-check failure is intentionally non-fatal.
         missing_questions = sorted(set(answers) - questions_seen)
         failed_matches = sorted(
             q for q in answers
             if correct_options_found.get(q, 0) < 1
         )
 
-        # Cross-check failure is a warning, NOT an exception.
-        # Mark every located option for an unmatched question in yellow.
         yellow_count = 0
-        for q in failed_matches:
-            for page_index, rect in option_rectangles.get(q, []):
+        for question in failed_matches:
+            for page_index, rect in option_rectangles.get(question, []):
                 add_highlight(doc[page_index], rect, HIGHLIGHT_YELLOW)
                 yellow_count += 1
 
         if missing_questions or failed_matches:
-            _log(progress_callback, "WARNING: ANSWER-KEY CROSS-CHECK NEEDS REVIEW.")
-            if missing_questions:
-                _log(
-                    progress_callback,
-                    "Questions not detected in question pages: "
-                    + ", ".join(map(str, missing_questions))
-                )
-            if failed_matches:
-                _log(
-                    progress_callback,
-                    "Correct option could not be matched: "
-                    + ", ".join(map(str, failed_matches))
-                )
-                _log(progress_callback, "Their detected option text has been marked yellow.")
-            _log(progress_callback, "The PDF will still be generated.")
+            warning = (
+                "WARNING: Some answers need manual review. "
+                f"Questions not detected: {len(missing_questions)}; "
+                f"questions without a matched correct option: {len(failed_matches)}. "
+                "Available options for failed matches are marked yellow."
+            )
+            report(warning, progress_callback)
         else:
-            _log(
-                progress_callback,
-                f"Answer-key cross-check passed: all {len(answers)} questions matched."
+            report(
+                f"Answer-key cross-check passed: all {len(answers)} questions matched.",
+                progress_callback
             )
 
-        # -------------------- SAVE OUTPUT --------------------
-
-        _log(progress_callback, "Applying highlights and saving the solution PDF...")
+        # Save beside the uploaded file. The web app may use its own temp folder.
         output_path = input_path.with_name(
             input_path.stem + " with answers" + input_path.suffix
         )
@@ -299,12 +509,12 @@ def process_pdf(input_path, progress_callback=None):
             output_path.unlink()
 
         doc.save(str(output_path), garbage=4, deflate=True)
-        _log(progress_callback, "Successfully created the solution PDF.")
-        _log(progress_callback, f"Answer-key questions: {len(answers)}")
-        _log(progress_callback, f"Questions detected: {len(questions_seen)}")
-        _log(progress_callback, f"Green highlight segments: {total_green}")
-        _log(progress_callback, f"Yellow fallback segments: {yellow_count}")
 
+        report(
+            f"Completed. Green highlights: {total_green}; "
+            f"yellow manual-review segments: {yellow_count}.",
+            progress_callback
+        )
         return output_path
 
     finally:

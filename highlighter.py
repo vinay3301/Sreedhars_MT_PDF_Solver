@@ -16,10 +16,6 @@ HIGHLIGHT_GREEN = (6 / 255, 85 / 255, 53 / 255)
 HIGHLIGHT_YELLOW = (1.0, 0.85, 0.0)
 HIGHLIGHT_OPACITY = 0.30
 
-# Only names such as "Model Test 100.pdf" are accepted.
-# Case-insensitive; one or more digits are required.
-VALID_FILENAME_RE = re.compile(r"^Model\s+Test\s+\d+\.pdf$", re.IGNORECASE)
-
 
 # -------------------- PROGRESS / ERRORS --------------------
 
@@ -54,11 +50,7 @@ def validate_upload(input_path):
         raise PDFValidationError("Upload failed: the selected file was not found.")
 
     # 1. Filename pattern.
-    if not VALID_FILENAME_RE.fullmatch(input_path.name):
-        raise PDFValidationError(
-            "Invalid filename. Please use the format 'Model Test 100.pdf' "
-            "(the number may vary)."
-        )
+    #Handled by app.py
 
     # 2. Extension.
     if input_path.suffix.lower() != ".pdf":
